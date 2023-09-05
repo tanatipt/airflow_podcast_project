@@ -49,7 +49,7 @@ with DAG("podcast_summary", start_date=datetime(2022, 5, 31), catchup=False) as 
         for show, episodes in shows.items():
             for episode in episodes:
                 filename = f"{episode['link'].split('/')[-1]}.mp3"
-                audio_path = f"/mnt/c/Users/User/Documents/airflow_podcast_project/{show}/{filename}"
+                audio_path = f"/mnt/c/Users/User/Documents/personal_projects/podcast_etl_project/{show}/{filename}"
 
                 if not os.path.exists(audio_path):
                     audio = requests.get(episode["enclosure"]["@url"])
