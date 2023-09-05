@@ -3,16 +3,35 @@ from datetime import datetime
 from airflow.decorators import task
 import requests
 import xmltodict
+from bs4 import BeautifulSoup
+from podcast_producer import run_producer
+from podcast_consumer import run_consumer
 from airflow.providers.mongo.hooks.mongo import MongoHook
+from topic_definition import delete_topic, create_topic
 import os
 
-mongo_id = "mongoid"
 with DAG("podcast_summary", start_date=datetime(2022, 5, 31), catchup=False) as dag:
 
-    @task
-    def get_episodes(task_id="get_episodes"):
+    @task(task_id="get_shows")
+    def get_shows():
+        data = requests.get("https://www.marketplace.org/")
+        soup = BeautifulSoup(data.text)
+
+        heading = soup.find("li",  {"class": "heading"})
+        show_tags = heading.find_next_siblings()
+        show_names = []
+
+        for tag in show_tags:
+            a_tag = tag.find("a")
+            link = a_tag["href"].split("/")
+            show_names.append(link[4])
+
+        return show_names
+
+    @task(task_id="get_episodes")
+    def get_episodes(ti=None):
         shows = {}
-        shows_name = ["marketplace", "make-me-smart", "the-uncertain-hour"]
+        shows_name = ti.xcom_pull(key="return_value", task_ids="get_shows")
         for show in shows_name:
             data = requests.get(
                 "https://www.marketplace.org/feed/podcast/" + show)
@@ -22,36 +41,8 @@ with DAG("podcast_summary", start_date=datetime(2022, 5, 31), catchup=False) as 
 
         return shows
 
-    def compute_sec(time_str):
-        h, m, s = time_str.split(':')
-        return int(h) * 3600 + int(m) * 60 + int(s)
-
-    @task
-    def load_episodes(ti=None, task_id="load_episodes"):
-        shows = ti.xcom_pull(
-            key='return_value', task_ids="get_episodes")
-
-        hook = MongoHook(conn_id=mongo_id)
-        client = hook.get_conn()
-        db = client["podcast_data"]
-
-        for show, episodes in shows.items():
-            collection = db[show]
-
-            for episode in episodes:
-                duration = compute_sec(episode["itunes:duration"])
-
-                filename = f"{episode['link'].split('/')[-1]}.mp3"
-                episode_document = {"link": episode["link"], "title": episode["title"], "pubDate": episode["pubDate"], "description": episode["description"], "episodesType": episode["itunes:episodeType"], "explicit":
-                                    episode["itunes:explicit"], "duration": duration, "author": episode["itunes:author"], "filename": filename}
-
-                collection.update_one({"title": episode["title"]},
-                                      {"$set": episode_document}, upsert=True)
-
-    loading = load_episodes()
-
-    @task
-    def download_episodes(ti=None, task_id="download_episodes"):
+    @task(task_id="download_episodes")
+    def download_episodes(ti=None):
         shows = ti.xcom_pull(
             key='return_value', task_ids="get_episodes")
 
@@ -66,13 +57,13 @@ with DAG("podcast_summary", start_date=datetime(2022, 5, 31), catchup=False) as 
                     with open(audio_path, "wb+") as f:
                         f.write(audio.content)
 
-    @task
-    def show_statistics(task_id="show_statistics"):
-        hook = MongoHook(conn_id=mongo_id)
+    @task(task_id="show_statistics")
+    def show_statistics(ti=None):
+        hook = MongoHook(conn_id="mongoid")
         client = hook.get_conn()
         db = client["podcast_data"]
         shows_data = db["show_statistics"]
-        shows_name = ["marketplace", "make-me-smart", "the-uncertain-hour"]
+        shows_name = ti.xcom_pull(key="return_value", task_ids="get_shows")
 
         for show in shows_name:
             pipeline = [{"$match": {"description": {"$ne": None}, "title": {"$ne": None}}}, {"$set": {"description_words":  {"$size": {"$split": ["$description", " "]}}, "title_words":  {"$size": {"$split": ["$title", " "]}}}},
@@ -83,5 +74,14 @@ with DAG("podcast_summary", start_date=datetime(2022, 5, 31), catchup=False) as 
             shows_data.update_one({"show_name": show},
                                   {"$set": statistics}, upsert=True)
 
-    get_episodes() >> [loading, download_episodes()]
-    loading >> show_statistics()
+    topic_create = create_topic()
+    topic_delete = delete_topic()
+    producer_run = run_producer()
+    consumer_run = run_consumer()
+    retrieve_episodes = get_episodes()
+
+    get_shows() >> retrieve_episodes >> topic_create >> [
+        producer_run, consumer_run] >> topic_delete
+    topic_create >> topic_delete
+    consumer_run >> show_statistics()
+    retrieve_episodes >> download_episodes()
